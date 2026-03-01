@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+from io import BytesIO
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 
@@ -11,48 +12,75 @@ import streamlit as st
 from openai import OpenAI
 from openai import APIError, RateLimitError, APITimeoutError, APIConnectionError
 
+# DOCX
+from docx import Document
+from docx.shared import Pt
+
 
 # =========================
-# Konfiguracja i stałe
+# Konfiguracja
 # =========================
 
-DEFAULT_MODEL = "gpt-4.1-mini"  # możesz zmienić na inny model dostępny na Twoim koncie
+DEFAULT_MODEL = "gpt-4.1-mini"
 MAX_RETRIES = 4
 
-SYSTEM_PROMPT = """Jesteś redaktorem medycznym i ekspertem SEO. Twoim zadaniem jest optymalizacja treści medycznej w Markdown pod SEO.
-KRYTYCZNE ZASADY BEZPIECZEŃSTWA I RZETELNOŚCI:
-- Opieraj się WYŁĄCZNIE na informacjach zawartych w dostarczonym tekście. Nie dodawaj nowych faktów medycznych.
-- Nie wymyślaj danych, statystyk, zaleceń, przeciwwskazań ani informacji klinicznych, których nie ma w tekście.
-- Jeśli fraza nie pasuje merytorycznie do treści, pomiń ją.
-- Nie zmieniaj znaczenia ani wniosków medycznych. Nie dodawaj nowych rekomendacji.
-ZASADY EDYCJI:
-- Zachowaj format Markdown oraz istniejącą strukturę nagłówków (H2, H3 itd.) i kolejność sekcji.
-- Frazy kluczowe wplataj naturalnie (bez keyword stuffingu), głównie w istniejące akapity.
-- Nowe sekcje H2 możesz dodawać WYŁĄCZNIE NA KOŃCU dokumentu (po całej istniejącej treści) i tylko, jeśli to konieczne, aby sensownie uwzględnić część fraz.
-- Nie dodawaj nowych H2 w środku dokumentu ani nie przemieszczaj istniejących sekcji.
+# „Agresywniej”, ale nadal: 0 nowych faktów medycznych.
+SYSTEM_PROMPT = """Jesteś redaktorem medycznym oraz specjalistą SEO (Surfer SEO).
+Twoim zadaniem jest zoptymalizować artykuł medyczny w Markdown pod wskazane frazy.
+
+KRYTYCZNE ZASADY RZETELNOŚCI (NIE DO NARUSZENIA):
+- Opieraj się WYŁĄCZNIE na informacjach zawartych w dostarczonym tekście.
+- Nie dodawaj żadnych nowych faktów medycznych, zaleceń, statystyk, diagnoz, przeciwwskazań ani informacji klinicznych.
+- Nie „dopowiadaj” wiedzy ogólnej. Jeśli czegoś nie ma w tekście, nie wolno tego wprowadzić.
+- Jeśli fraza nie pasuje merytorycznie do treści lub wymagałaby dodania nowych informacji, pomiń ją.
+
+ZASADY SEO / SURFER (AGRESYWNA, ALE BEZPIECZNA OPTYMALIZACJA):
+- Priorytet: użyj jak największej liczby fraz w DOKŁADNYM brzmieniu (literalnie).
+- Możesz zwiększać częstotliwość fraz przez:
+  * krótkie doprecyzowania zdań w istniejących akapitach,
+  * krótkie śródtytuły H3 (bez zmiany sensu),
+  * sekcje podsumowań i FAQ na końcu, które powtarzają i parafrazują treść WYŁĄCZNIE z artykułu.
+- Unikaj keyword stuffingu w jednym miejscu: rozkładaj frazy równomiernie.
+
+STRUKTURA:
+- Zachowaj format Markdown i istniejącą strukturę nagłówków.
+- Nie przestawiaj sekcji.
+- Nowe sekcje H2 możesz dodać WYŁĄCZNIE NA KOŃCU dokumentu.
+- Nowe H3 w środku dokumentu są dozwolone tylko, jeśli logicznie pasują do istniejącej sekcji.
+
 FORMAT ODPOWIEDZI:
-- Zwróć WYŁĄCZNIE poprawny JSON w formacie opisanym w wiadomości użytkownika. Bez dodatkowego tekstu.
+- Zwróć WYŁĄCZNIE poprawny JSON (bez dodatkowego tekstu).
 """
 
 USER_PROMPT_TEMPLATE = """Masz:
-1) Listę fraz kluczowych (każda w osobnej linii)
-2) Artykuł medyczny w Markdown
+1) listę fraz kluczowych (każda w osobnej linii)
+2) artykuł medyczny w Markdown
 
-Twoje zadanie:
-- Najpierw spróbuj wpleść jak najwięcej fraz w istniejące akapity, bez zmiany faktów medycznych.
-- Jeśli po naturalnym wpleceniu zostają frazy, które DA SIĘ sensownie dodać bez nowych faktów medycznych, dodaj na końcu dokumentu jedną lub kilka nowych sekcji H2 z krótkimi akapitami (wciąż bez dodawania faktów).
-- Jeśli fraza nie pasuje merytorycznie do treści lub wymagałaby dodania nowych informacji, POMIŃ ją.
+Cel: podnieś scoring Surfer SEO możliwie mocno, ALE bez dodawania nowych faktów medycznych.
 
 Instrukcja obowiązkowa (dosłownie):
 "Opieraj się wyłącznie na informacjach zawartych w dostarczonym tekście. Nie dodawaj nowych faktów medycznych. Jeśli fraza nie pasuje merytorycznie do treści, pomiń ją."
 
-Zwróć WYŁĄCZNIE JSON o polach:
-- optimized_markdown: string (wynikowy Markdown)
-- used_phrases: array[string] (frazy faktycznie użyte w tekście, w brzmieniu dokładnie jak wejście)
-- skipped_phrases: array[string] (frazy pominięte)
-- brief_notes: array[string] (krótkie notatki np. dlaczego coś pominięto; bez dodawania wiedzy medycznej)
+Zasady wykonania:
+1) Najpierw wpleć frazy w istniejące akapity, tak aby były naturalne i merytoryczne.
+2) Jeśli zostały frazy, które można dodać bez nowych faktów:
+   - dodaj na końcu dokumentu nowe sekcje H2:
+     a) "Podsumowanie"
+     b) "FAQ"
+   Treść w tych sekcjach ma WYŁĄCZNIE powtarzać/parafrazować informacje już obecne w artykule.
+   W FAQ formułuj pytania i odpowiedzi tak, aby nie wprowadzać żadnych nowych informacji.
+3) Staraj się użyć jak największej liczby fraz w dokładnym brzmieniu.
+4) Kontroluj intensywność:
+   - target_used_ratio: {target_used_ratio} (np. 0.85 oznacza „postaraj się użyć 85% fraz” jeśli pasują)
+   - max_total_phrase_occurrences: {max_total_phrase_occurrences} (maksymalna łączna liczba wystąpień fraz – rozkładaj je po tekście)
 
-FRAZY (jedna na linię):
+Zwróć WYŁĄCZNIE JSON o polach:
+- optimized_markdown: string
+- used_phrases: array[string] (frazy faktycznie użyte, dokładnie jak wejście)
+- skipped_phrases: array[string]
+- brief_notes: array[string] (krótkie notatki dlaczego coś pominięto / jak rozłożono frazy; bez wiedzy medycznej)
+
+FRAZY:
 {phrases}
 
 TEKST MARKDOWN:
@@ -61,11 +89,10 @@ TEKST MARKDOWN:
 
 
 # =========================
-# Narzędzia: parsing / walidacje
+# Helpers: frazy, walidacje, liczniki
 # =========================
 
 def normalize_phrase_lines(raw: str) -> List[str]:
-    """Czyści wejściowe frazy: usuwa puste linie, trimuje, deduplikuje z zachowaniem kolejności."""
     lines = [ln.strip() for ln in (raw or "").splitlines()]
     lines = [ln for ln in lines if ln]
     seen = set()
@@ -79,12 +106,10 @@ def normalize_phrase_lines(raw: str) -> List[str]:
 
 
 def markdown_code_fences_balanced(md: str) -> bool:
-    """Sprawdza czy liczba ``` jest parzysta (prosty test poprawności bloków kodu)."""
     return (md.count("```") % 2) == 0
 
 
 def extract_h2_headings(md: str) -> List[str]:
-    """Wyciąga listę nagłówków H2 (## ...)."""
     headings = []
     for m in re.finditer(r"(?m)^\s*##\s+(.+?)\s*$", md):
         headings.append(m.group(1).strip())
@@ -92,62 +117,43 @@ def extract_h2_headings(md: str) -> List[str]:
 
 
 def validate_h2_added_only_at_end(original_md: str, optimized_md: str) -> Tuple[bool, str]:
-    """
-    Walidacja: wszystkie oryginalne H2 muszą pojawić się w tej samej kolejności,
-    a ewentualne nowe H2 mogą pojawić się dopiero po ostatnim oryginalnym H2 w output.
-    """
     orig_h2 = extract_h2_headings(original_md)
     opt_h2 = extract_h2_headings(optimized_md)
 
-    # Jeśli nie było H2 w oryginale, dopuszczamy H2, ale wymagamy, żeby treść oryginalna nie była "pocięta".
-    # (W praktyce: zostawiamy tylko miękką walidację.)
     if not orig_h2:
         return True, "Brak H2 w oryginale — pomijam twardą walidację kolejności H2."
 
-    # Sprawdź, czy orig_h2 jest podciągiem opt_h2 w tej samej kolejności.
-    i = 0
-    for h in opt_h2:
-        if i < len(orig_h2) and h == orig_h2[i]:
-            i += 1
-    if i != len(orig_h2):
-        return False, "Wynik narusza kolejność/obecność istniejących nagłówków H2 (zostały zmienione, usunięte lub przestawione)."
-
-    # Znajdź indeks ostatniego oryginalnego H2 w opt_h2
-    last_idx = -1
-    for idx, h in enumerate(opt_h2):
-        if h == orig_h2[-1]:
-            last_idx = idx
-
-    # Jeśli w opt_h2 są dodatkowe H2 przed last_idx, to znaczy, że nowe H2 wstawiono w środku.
-    # Ale uwaga: opt_h2 może zawierać te same nazwy H2 (duplikaty). Wymagamy tylko, aby
-    # pierwsze wystąpienie sekwencji oryginalnych H2 było zachowane i nowe H2 nie wchodziły pomiędzy.
-    # Prostsze: sprawdzamy, czy wszystkie H2 przed "ukończeniem" sekwencji oryginalnej są równe odpowiednim oryginałom.
+    # oryginalne H2 muszą wystąpić w tej samej kolejności
     seq_pos = 0
     for h in opt_h2:
         if seq_pos < len(orig_h2) and h == orig_h2[seq_pos]:
             seq_pos += 1
         else:
-            # jeśli jeszcze nie domknęliśmy wszystkich oryginalnych H2, a trafiamy na inny H2 -> nowe H2 w środku
+            # jeśli jeszcze nie domknęliśmy oryginalnych H2, a trafiamy na inny H2 => nowe H2 w środku
             if seq_pos < len(orig_h2):
-                return False, "Wynik wstawia nowe sekcje H2 w środku dokumentu. Nowe H2 mogą być tylko na końcu."
+                return False, "Wynik wstawia nowe H2 w środku dokumentu. Nowe H2 mogą być tylko na końcu."
 
-    return True, "Walidacja H2 OK (nowe H2 — jeśli są — znajdują się po całej istniejącej strukturze)."
+    if seq_pos != len(orig_h2):
+        return False, "Wynik narusza obecność/ciągłość oryginalnych H2 (zmienione/usunięte)."
+
+    return True, "Walidacja H2 OK (nowe H2 — jeśli są — znajdują się na końcu)."
 
 
-def count_phrase_usage_by_presence(phrases: List[str], optimized_md: str) -> Dict[str, bool]:
+def count_phrase_occurrences(phrases: List[str], text: str) -> Dict[str, int]:
     """
-    Liczy użycie fraz przez sprawdzenie obecności (case-insensitive) w tekście wynikowym.
-    Uwaga: to nie jest idealne (odmiany fleksyjne), ale jest proste i przewidywalne.
+    Liczy literalne wystąpienia frazy (case-insensitive).
+    Uwaga: to celowe — Surfer często liczy literalnie.
     """
-    text = optimized_md.lower()
-    usage = {}
+    low = text.lower()
+    out = {}
     for ph in phrases:
-        usage[ph] = ph.lower() in text
-    return usage
+        # prosty count; jeśli potrzebujesz boundary, można rozbudować regexem
+        out[ph] = low.count(ph.lower())
+    return out
 
 
 # =========================
-# OpenAI: wywołanie + retry + JSON parse
+# OpenAI: call + retry + JSON parse
 # =========================
 
 @dataclass
@@ -171,7 +177,7 @@ def call_openai_with_retries(
     model: str,
     system_prompt: str,
     user_prompt: str,
-    temperature: float = 0.2,
+    temperature: float = 0.3,
 ) -> str:
     last_err: Optional[Exception] = None
 
@@ -188,34 +194,23 @@ def call_openai_with_retries(
             return resp.choices[0].message.content or ""
         except (RateLimitError, APITimeoutError, APIConnectionError, APIError) as e:
             last_err = e
-            # prosty backoff
-            sleep_s = min(2 ** attempt, 16)
-            time.sleep(sleep_s)
+            time.sleep(min(2 ** attempt, 16))
 
     raise RuntimeError(f"Nie udało się wykonać zapytania do API po {MAX_RETRIES} próbach. Ostatni błąd: {last_err}")
 
 
 def parse_strict_json(text: str) -> Dict:
-    """
-    Model ma zwrócić wyłącznie JSON, ale w praktyce bywa różnie.
-    Ta funkcja próbuje:
-    - wczytać całość jako JSON,
-    - jeśli nie wyjdzie, wyciąć największy blok { ... } i wczytać ponownie.
-    """
     text = (text or "").strip()
 
-    # 1) próba wprost
     try:
         return json.loads(text)
     except Exception:
         pass
 
-    # 2) wytnij największy blok JSON
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
-        chunk = text[start : end + 1]
-        return json.loads(chunk)
+        return json.loads(text[start:end + 1])
 
     raise ValueError("Nie udało się sparsować JSON z odpowiedzi modelu.")
 
@@ -225,11 +220,16 @@ def optimize_markdown_medical(
     markdown: str,
     model: str,
     temperature: float,
+    target_used_ratio: float,
+    max_total_phrase_occurrences: int,
 ) -> OptimizeResult:
     client = get_openai_client()
+
     user_prompt = USER_PROMPT_TEMPLATE.format(
         phrases="\n".join(phrases),
         markdown=markdown,
+        target_used_ratio=f"{target_used_ratio:.2f}",
+        max_total_phrase_occurrences=str(max_total_phrase_occurrences),
     )
 
     raw = call_openai_with_retries(
@@ -247,7 +247,6 @@ def optimize_markdown_medical(
     skipped = data.get("skipped_phrases", []) or []
     notes = data.get("brief_notes", []) or []
 
-    # Minimalne sanity-checki typów
     if not isinstance(used, list):
         used = []
     if not isinstance(skipped, list):
@@ -265,42 +264,102 @@ def optimize_markdown_medical(
 
 
 # =========================
+# Markdown -> DOCX (proste, ale skuteczne pod Surfer)
+# =========================
+
+def markdown_to_docx_bytes(md: str) -> bytes:
+    """
+    Minimalny konwerter Markdown -> DOCX:
+    - #, ##, ### -> nagłówki (level 1/2/3)
+    - listy "- " i "* " -> listy punktowane
+    - reszta -> akapity
+    Zachowuje czytelność nagłówków dla Surfera.
+    """
+    doc = Document()
+
+    # domyślna czcionka (opcjonalnie)
+    style = doc.styles["Normal"]
+    style.font.name = "Calibri"
+    style.font.size = Pt(11)
+
+    lines = (md or "").splitlines()
+
+    current_list = False
+    for line in lines:
+        ln = line.rstrip()
+
+        # pusta linia -> nowy akapit (przerwa)
+        if not ln.strip():
+            doc.add_paragraph("")
+            current_list = False
+            continue
+
+        # Nagłówki
+        m1 = re.match(r"^\s*#\s+(.+)$", ln)
+        m2 = re.match(r"^\s*##\s+(.+)$", ln)
+        m3 = re.match(r"^\s*###\s+(.+)$", ln)
+
+        if m1:
+            doc.add_heading(m1.group(1).strip(), level=1)
+            current_list = False
+            continue
+        if m2:
+            doc.add_heading(m2.group(1).strip(), level=2)
+            current_list = False
+            continue
+        if m3:
+            doc.add_heading(m3.group(1).strip(), level=3)
+            current_list = False
+            continue
+
+        # Lista punktowana
+        if re.match(r"^\s*[-*]\s+.+", ln):
+            text = re.sub(r"^\s*[-*]\s+", "", ln).strip()
+            doc.add_paragraph(text, style="List Bullet")
+            current_list = True
+            continue
+
+        # Normalny akapit (bez agresywnego formatowania inline)
+        doc.add_paragraph(ln)
+        current_list = False
+
+    bio = BytesIO()
+    doc.save(bio)
+    return bio.getvalue()
+
+
+# =========================
 # Streamlit UI
 # =========================
 
-def clipboard_button(markdown_text: str):
-    """
-    Przycisk kopiowania do schowka z użyciem małego kawałka JS.
-    Działa w większości przeglądarek; w niektórych środowiskach może wymagać https.
-    """
-    import streamlit.components.v1 as components
-
-    escaped = markdown_text.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
-    html = f"""
-    <button style="padding:0.5rem 0.75rem;border-radius:0.5rem;border:1px solid #ddd;cursor:pointer;"
-      onclick="navigator.clipboard.writeText(`{escaped}`)">
-      📋 Kopiuj wynik do schowka
-    </button>
-    """
-    components.html(html, height=55)
-
-
 def main():
-    st.set_page_config(page_title="Surfer SEO – Medical Markdown Optimizer", layout="wide")
+    st.set_page_config(page_title="Surfer SEO – Medical Optimizer (DOCX)", layout="wide")
 
-    st.title("Surfer SEO – Medical Markdown Optimizer (Markdown → Markdown)")
+    st.title("Surfer SEO – Medical Optimizer (Markdown in → DOCX out)")
     st.caption(
-        "Wplata frazy kluczowe naturalnie w istniejący tekst medyczny bez dodawania nowych faktów. "
-        "Nowe sekcje H2 — tylko na końcu (jeśli konieczne)."
+        "Wersja agresywniejsza pod Surfer: literalne frazy + kontrolowane powtórzenia + Podsumowanie/FAQ na końcu "
+        "(wyłącznie na bazie treści źródłowej, bez nowych faktów medycznych)."
     )
 
     with st.sidebar:
         st.header("Ustawienia")
-        model = st.text_input("Model OpenAI", value=DEFAULT_MODEL, help="Np. gpt-4.1-mini / inny dostępny model")
-        temperature = st.slider("Temperature", 0.0, 0.8, 0.2, 0.05, help="Niżej = bardziej zachowawczo i spójnie")
+        model = st.text_input("Model OpenAI", value=DEFAULT_MODEL)
+        temperature = st.slider("Temperature", 0.0, 0.9, 0.35, 0.05,
+                                help="Trochę wyżej niż wcześniej: więcej redakcji/rozbudowy, ale wciąż kontrolowanie.")
         st.markdown("---")
-        st.markdown("**Wymagane:** ustaw `OPENAI_API_KEY` w zmiennych środowiskowych.")
-        st.markdown("**Bezpieczeństwo medyczne:** narzędzie nie może dodawać nowych faktów — tylko redaguje i porządkuje.")
+        st.subheader("Agresywność (Surfer)")
+        target_used_ratio = st.slider("Cel użycia fraz (ratio)", 0.50, 1.00, 0.85, 0.05,
+                                      help="Ile fraz model ma próbować użyć (o ile pasują merytorycznie).")
+        max_total_phrase_occurrences = st.number_input(
+            "Maks. łączna liczba wystąpień fraz",
+            min_value=10,
+            max_value=500,
+            value=120,
+            step=10,
+            help="Limit bezpieczeństwa przed totalnym keyword stuffing. Frazy będą rozkładane po tekście."
+        )
+        st.markdown("---")
+        st.markdown("**Wymagane:** `OPENAI_API_KEY` w zmiennych środowiskowych.")
 
     col1, col2 = st.columns(2, gap="large")
 
@@ -326,39 +385,40 @@ def main():
         st.write(f"Długość tekstu: **{len(markdown_in)}** znaków")
 
     st.markdown("---")
-
-    run = st.button("🚀 Optymalizuj", type="primary", use_container_width=True, disabled=(not phrases or not markdown_in))
+    run = st.button("🚀 Optymalizuj (agresywnie)", type="primary", use_container_width=True,
+                    disabled=(not phrases or not markdown_in))
 
     if run:
-        # Szybkie walidacje wejścia
         if not markdown_code_fences_balanced(markdown_in):
-            st.error("Wejściowy Markdown ma nieparzystą liczbę znaczników ``` (prawdopodobnie niezamknięty blok kodu). Popraw i spróbuj ponownie.")
+            st.error("Wejściowy Markdown ma niezamknięty blok ``` (nieparzysta liczba). Popraw i spróbuj ponownie.")
             st.stop()
 
         try:
-            with st.status("Przetwarzam treść i wplatam frazy...", expanded=True) as status:
+            with st.status("Optymalizuję treść pod Surfer…", expanded=True) as status:
                 status.write("Łączenie z API OpenAI…")
                 result = optimize_markdown_medical(
                     phrases=phrases,
                     markdown=markdown_in,
                     model=model,
                     temperature=temperature,
+                    target_used_ratio=target_used_ratio,
+                    max_total_phrase_occurrences=int(max_total_phrase_occurrences),
                 )
 
-                status.write("Walidacja struktury Markdown…")
-                if not result.optimized_markdown:
-                    raise RuntimeError("Model zwrócił pusty wynik. Spróbuj ponownie albo zmień model/temperature.")
-
-                if not markdown_code_fences_balanced(result.optimized_markdown):
-                    st.warning("Uwaga: wynikowy Markdown ma nieparzystą liczbę znaczników ``` (może wymagać ręcznej korekty).")
-
+                status.write("Walidacja struktury H2…")
                 ok_h2, msg_h2 = validate_h2_added_only_at_end(markdown_in, result.optimized_markdown)
                 if not ok_h2:
                     st.error(msg_h2)
-                    st.info("Wskazówka: zmniejsz temperature i spróbuj ponownie albo dopisz w tekście więcej kontekstu do fraz.")
+                    st.info("Wskazówka: zmniejsz temperature lub ogranicz agresywność (ratio / max occurrences).")
                     st.stop()
                 else:
                     status.write(msg_h2)
+
+                status.write("Liczenie wystąpień fraz…")
+                occ = count_phrase_occurrences(phrases, result.optimized_markdown)
+
+                status.write("Generowanie DOCX…")
+                docx_bytes = markdown_to_docx_bytes(result.optimized_markdown)
 
                 status.update(label="Gotowe ✅", state="complete", expanded=False)
 
@@ -366,50 +426,43 @@ def main():
             st.error(f"Błąd: {e}")
             st.stop()
 
-        # Liczenie użycia: (a) deklaratywnie z JSON (b) weryfikacja presence
-        declared_used = set([p.strip() for p in result.used_phrases])
-        declared_skipped = set([p.strip() for p in result.skipped_phrases])
+        # Raport: wykryte użycia literalne
+        used_detected = [p for p, c in occ.items() if c > 0]
+        unused_detected = [p for p, c in occ.items() if c == 0]
+        total_occ = sum(occ.values())
 
-        presence = count_phrase_usage_by_presence(phrases, result.optimized_markdown)
-        present_used = {p for p, is_used in presence.items() if is_used}
-        present_unused = {p for p, is_used in presence.items() if not is_used}
+        st.subheader("3) Wynik: podgląd Markdown (roboczy)")
+        st.text_area("Zoptymalizowany Markdown", value=result.optimized_markdown, height=320)
 
-        st.subheader("3) Wynik (Markdown)")
-        st.text_area("Zoptymalizowany Markdown", value=result.optimized_markdown, height=380)
-
-        # Akcje: kopiuj + pobierz
-        a1, a2 = st.columns([1, 1], gap="large")
-        with a1:
-            clipboard_button(result.optimized_markdown)
-        with a2:
-            st.download_button(
-                "💾 Pobierz jako .md",
-                data=result.optimized_markdown.encode("utf-8"),
-                file_name="optimized.md",
-                mime="text/markdown",
-                use_container_width=True,
-            )
+        st.subheader("4) Pobierz plik DOCX (do Surfera)")
+        st.download_button(
+            "💾 Pobierz optimized.docx",
+            data=docx_bytes,
+            file_name="optimized.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+        )
 
         st.markdown("---")
-        st.subheader("4) Licznik fraz i raport")
+        st.subheader("5) Licznik fraz (Surfer-oriented)")
 
-        # Panel metryk
-        m1, m2, m3 = st.columns(3)
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("Frazy wejściowe", len(phrases))
-        m2.metric("Użyte (wykryte w tekście)", len(present_used))
-        m3.metric("Nieużyte (wykryte)", len(present_unused))
+        m2.metric("Użyte (wykryte literalnie)", len(used_detected))
+        m3.metric("Nieużyte (wykryte)", len(unused_detected))
+        m4.metric("Łączne wystąpienia fraz", total_occ)
 
-        with st.expander("Szczegóły: użyte / nieużyte"):
-            st.markdown("**Użyte (wykryte w wynikowym Markdown):**")
-            st.write(sorted(present_used))
-            st.markdown("**Nie użyte (wykryte):**")
-            st.write(sorted(present_unused))
+        with st.expander("Wystąpienia każdej frazy (literalnie)"):
+            # sort: najpierw najczęstsze
+            rows = sorted(occ.items(), key=lambda x: x[1], reverse=True)
+            for ph, c in rows:
+                st.write(f"- **{ph}** → {c}")
 
-        with st.expander("Szczegóły: deklaracja modelu (used_phrases / skipped_phrases)"):
-            st.markdown("**used_phrases (deklaracja):**")
-            st.write(sorted(declared_used))
-            st.markdown("**skipped_phrases (deklaracja):**")
-            st.write(sorted(declared_skipped))
+        with st.expander("Deklaracja modelu: used_phrases / skipped_phrases"):
+            st.markdown("**used_phrases (deklaracja modelu):**")
+            st.write(result.used_phrases)
+            st.markdown("**skipped_phrases (deklaracja modelu):**")
+            st.write(result.skipped_phrases)
 
         if result.brief_notes:
             with st.expander("Notatki modelu (brief_notes)"):
