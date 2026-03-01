@@ -1,15 +1,11 @@
-# Surfer SEO – Medical Markdown Optimizer
+# Surfer SEO – Medical Optimizer (Markdown in → DOCX out)
 
-Aplikacja Streamlit do optymalizacji istniejących artykułów medycznych w Markdown pod frazy z Surfer SEO:
-- wplata frazy naturalnie w istniejące akapity (bez keyword stuffingu),
-- NIE dodaje nowych faktów medycznych (opiera się tylko na tekście wejściowym),
-- nowe sekcje H2 (jeśli konieczne) dodaje WYŁĄCZNIE na końcu dokumentu,
-- pokazuje licznik użytych fraz,
-- pozwala skopiować wynik do schowka i pobrać `.md`.
-
-## Wymagania
-- Python 3.10+
-- Klucz API: `OPENAI_API_KEY`
+Agresywniejsza optymalizacja pod Surfer SEO:
+- używa fraz literalnie (dokładne brzmienie),
+- rozkłada frazy w istniejących akapitach,
+- jeśli trzeba, dodaje NA KOŃCU dokumentu sekcje H2: **Podsumowanie** i **FAQ**,
+- treść nowych sekcji to wyłącznie powtórzenie/parafraza informacji z artykułu (zero nowych faktów medycznych),
+- eksportuje wynik do **DOCX**.
 
 ## Instalacja
 ```bash
